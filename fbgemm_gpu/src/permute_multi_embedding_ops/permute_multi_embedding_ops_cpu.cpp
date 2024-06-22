@@ -90,6 +90,82 @@ std::vector<Tensor> permute_multi_embedding_autograd(
       pooled_embs, permutes, in_lengths, out_lengths);
 }
 
+std::tuple<std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>>
+generate_keyed_tensor_permutes(
+    const std::vector<std::string>& keys,
+    const std::vector<std::string>& groups,
+    const std::vector<int64_t>& lengths,
+    const std::vector<int64_t>& in_splits,
+    const std::vector<int64_t>& out_splits) {
+  const int64_t permute_param = 6;
+  const int64_t in_tensors = in_splits.size();
+  const int64_t out_tensors = out_splits.size();
+  const int64_t in_num = lengths.size();
+  const int64_t out_num = groups.size();
+  std::vector<int64_t> permutes(out_num * permute_param, 0);
+  std::vector<int64_t> in_lengths(in_tensors, 0);
+  std::vector<int64_t> out_lengths(out_tensors, 0);
+
+  auto ilp = in_lengths.data();
+  int64_t* cumsum = new int64_t[in_num];
+  int64_t curr = 0;
+  std::unordered_map<std::string, std::tuple<int64_t, int64_t>> lookup;
+  for (int32_t in_tensor = 0; in_tensor < in_tensors; in_tensor++) {
+    for (int32_t in_key = 0; in_key < in_splits[in_tensor]; in_key++) {
+      cumsum[curr] = ilp[in_tensor];
+      ilp[in_tensor] += lengths[curr];
+      lookup.insert({keys[curr], {in_tensor, curr}});
+      curr++;
+    }
+  }
+
+  auto olp = out_lengths.data();
+  auto pp = permutes.data();
+  curr = 0;
+  std::unordered_map<int64_t, int64_t> last_seen;
+  for (int32_t out_tensor = 0; out_tensor < out_tensors; out_tensor++) {
+    for (int32_t out_key = 0; out_key < out_splits[out_tensor]; out_key++) {
+      auto [in_tensor, idx] = lookup.at(groups[curr]);
+      int64_t length = lengths[idx]; // length
+      pp[curr * permute_param] = in_tensor;
+      pp[curr * permute_param + 1] = out_tensor;
+
+      pp[curr * permute_param + 2] = cumsum[idx]; // in_start
+      pp[curr * permute_param + 3] = olp[out_tensor]; // out_start
+      pp[curr * permute_param + 4] = length;
+      olp[out_tensor] += length;
+      if (auto search = last_seen.find(idx); search == last_seen.end()) {
+        pp[curr * permute_param + 5] = 0;
+        last_seen.insert({idx, curr});
+      } else {
+        pp[curr * permute_param + 5] = -out_num;
+        if (search->second >= 0) {
+          pp[search->second * permute_param + 5] = curr;
+        } else {
+          pp[-search->second * permute_param + 5] = -curr;
+        }
+        search->second = -curr;
+      }
+      curr++;
+    }
+  }
+  delete[] cumsum;
+  return {permutes, in_lengths, out_lengths};
+}
+
+std::vector<Tensor> regroup_keyed_tensor(
+    const at::TensorList& pooled_embs,
+    const std::vector<std::string>& keys,
+    const std::vector<std::string>& groups,
+    const std::vector<int64_t>& lengths,
+    const std::vector<int64_t>& in_splits,
+    const std::vector<int64_t>& out_splits) {
+  auto [permutes, in_lengths, out_lengths] = generate_keyed_tensor_permutes(
+      keys, groups, lengths, in_splits, out_splits);
+  return PermuteMultiEmbeddingOp::apply(
+      pooled_embs, permutes, in_lengths, out_lengths);
+}
+
 } // namespace fbgemm_gpu
 
 TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
@@ -102,6 +178,20 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
   m.def(
       "permute_multi_embedding(Tensor[] pooled_embs, int[] permutes, SymInt[] in_lengths, SymInt[] out_lengths) -> Tensor[]",
       {PT2_COMPLIANT_TAG});
+
+  // register the main function for external usage
+  m.def(
+      "regroup_keyed_tensor(Tensor[] pooled_embs, str[] keys, str[] groups, int[] lengths, int[] in_splits, int[] out_splits) -> Tensor[]",
+      {PT2_COMPLIANT_TAG});
+
+  // register the permute function
+  m.def(
+      "generate_keyed_tensor_permutes(str[] keys, str[] groups, int[] lengths, int[] in_splits, int[] out_splits) -> (int[], int[], int[])",
+      {PT2_COMPLIANT_TAG});
+
+  DISPATCH_TO_ALL(
+      "generate_keyed_tensor_permutes",
+      fbgemm_gpu::generate_keyed_tensor_permutes);
 
   // dispatch the forward function to CPU for internal (autograd) usage
   DISPATCH_TO_CPU(
@@ -120,4 +210,11 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
   // dispath the main function to Autograd for external usage
   DISPATCH_TO_CUDA(
       "permute_multi_embedding", fbgemm_gpu::permute_multi_embedding_autograd);
+
+  // dispath the main function to Autograd for external usage
+  DISPATCH_TO_AUTOGRAD(
+      "regroup_keyed_tensor", fbgemm_gpu::regroup_keyed_tensor);
+
+  // dispath the main function to Autograd for external usage
+  DISPATCH_TO_CUDA("regroup_keyed_tensor", fbgemm_gpu::regroup_keyed_tensor);
 }
